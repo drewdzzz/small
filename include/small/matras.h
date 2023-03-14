@@ -154,6 +154,8 @@ struct matras_view {
 	struct matras_view *prev_view, *next_view;
 };
 
+struct matras_gc_state;
+
 /**
  * matras - memory allocator of blocks of equal
  * size with support of address translation.
@@ -179,6 +181,13 @@ struct matras {
 	matras_free_func free_func;
 	/* Argument passed to extent allocator */
 	void *alloc_ctx;
+	/* Pointer to the first gc state */
+	struct matras_gc_state *gc_state;
+	/*
+	 * Pointer to the last gc state. We will add gc tasks to the end of
+	 * list, not beginning, to reduce fragmentation
+	 */
+	struct matras_gc_state *last_gc_state;
 };
 
 /*

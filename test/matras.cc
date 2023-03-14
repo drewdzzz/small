@@ -13,7 +13,7 @@ static void
 pta_free(void *ctx, void *p);
 
 #define PROV_BLOCK_SIZE 16
-#define PROV_EXTENT_SIZE 64
+#define PROV_EXTENT_SIZE 128
 
 static size_t AllocatedCount = 0;
 static std::set<void*> AllocatedBlocks;

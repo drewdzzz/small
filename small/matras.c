@@ -13,6 +13,21 @@
 #endif
 
 /*
+ * State of read_view deletion.
+ * Is stored right in memory which is going to be deleted.
+ */
+struct matras_gc_state {
+	/* Iteration state */
+	matras_id_t i1, i2, j1, j2;
+	/* Block count of read_view and its neighbours */
+	matras_id_t block_count, prev_block_count, next_block_count;
+	/* Roots of read_view and neighbours */
+	void *root, *prev_root, *next_root;
+	/* Gc state of next deleted read_view */
+	struct matras_gc_state *next;
+};
+
+/*
  * Binary logarithm of value (exact if the value is a power of 2,
  * approximate (floored) otherwise)
  */
@@ -48,6 +63,8 @@ matras_create(struct matras *m, matras_id_t extent_size, matras_id_t block_size,
 	assert(block_size <= extent_size);
 	/*extent must be able to store at least two records*/
 	assert(extent_size > sizeof(void *));
+	/*extent must be able to store matras_gc_state*/
+	assert(extent_size > sizeof(struct matras_gc_state));
 
 	m->head.block_count = 0;
 	m->head.prev_view = 0;
@@ -58,6 +75,8 @@ matras_create(struct matras *m, matras_id_t extent_size, matras_id_t block_size,
 	m->alloc_func = alloc_func;
 	m->free_func = free_func;
 	m->alloc_ctx = alloc_ctx;
+	m->gc_state = NULL;
+	m->last_gc_state = NULL;
 
 	matras_id_t log1 = matras_log2(extent_size);
 	matras_id_t log2 = matras_log2(block_size);
@@ -69,7 +88,6 @@ matras_create(struct matras *m, matras_id_t extent_size, matras_id_t block_size,
 	m->mask2 = (((matras_id_t)1) << m->shift2) - ((matras_id_t)1);
 }
 
-
 /**
  * Free all memory used by an instance of matras and
  * reinitialize it.
@@ -80,7 +98,15 @@ matras_reset(struct matras *m)
 {
 	matras_destroy(m);
 	m->head.block_count = 0;
+	/* TODO: make sure that it is true */
+	assert(m->gc_state == NULL);
+	assert(m->last_gc_state == NULL);
 }
+
+static void
+matras_gc(struct matras *m, int64_t steps);
+
+#define MATRAS_GC_STEPS 67
 
 /**
  * Helper functions for allocating new extent and incrementing extent counter
@@ -91,8 +117,11 @@ matras_alloc_extent(struct matras *m)
 	void *ext = m->alloc_func(m->alloc_ctx);
 	if (ext)
 		m->extent_count++;
+	matras_gc(m, MATRAS_GC_STEPS);
 	return ext;
 }
+
+#undef MATRAS_GC_STEPS
 
 /**
  * Helper functions for allocating new extent and incrementing extent counter
@@ -112,6 +141,7 @@ matras_destroy(struct matras *m)
 {
 	while (m->head.prev_view)
 		matras_destroy_read_view(m, m->head.prev_view);
+	matras_gc(m, INT64_MAX);
 	if (m->head.block_count == 0)
 		return;
 
@@ -308,7 +338,8 @@ matras_create_read_view(struct matras *m, struct matras_view *v)
 }
 
 /*
- * Delete a read view.
+ * Prepare a read view for deletion - find free place in matras tree
+ * to store state. Actual delete will happen on gc.
  */
 void
 matras_destroy_read_view(struct matras *m, struct matras_view *v)
@@ -336,9 +367,30 @@ matras_destroy_read_view(struct matras *m, struct matras_view *v)
 		extent1p = (void **) prev_view->root;
 	matras_id_t step1 = m->mask1 + 1;
 	matras_id_t step2 = m->mask2 + 1;
-	matras_id_t i1 = 0, j1 = 0, i2, j2;
+	matras_id_t i1 = 0, j1 = 0, i2 = 0, j2 = 0;
 	matras_id_t ptrs_in_ext = m->extent_size / (matras_id_t)sizeof(void *);
-	for (; j1 < v->block_count; i1++, j1 += step1) {
+	/*
+	 * Now we need to find sizeof(matras_gc_state) sequential bytes to
+	 * write gc_state there. We can do it because extent_size is guaranteed
+	 * to be greater than required number of bytes. Also, this operation has
+	 * constant complexity.
+	 */
+	matras_id_t ptrs_required =
+		((matras_id_t)sizeof(struct matras_gc_state) - 1) /
+		(matras_id_t)sizeof(void *) + 1;
+	assert(ptrs_required <= ptrs_in_ext);
+	struct matras_gc_state gc_state;
+	memset(&gc_state, 0, sizeof(gc_state));
+	gc_state.next = NULL;
+	gc_state.root = extent1;
+	gc_state.next_root = extent1n;
+	gc_state.prev_root = extent1p;
+	gc_state.block_count = v->block_count;
+	gc_state.next_block_count = next_view->block_count;
+	gc_state.prev_block_count = prev_view ? prev_view->block_count : 0;
+	struct matras_gc_state *new_gc_state =
+		(struct matras_gc_state *)extent1;
+	for (; j1 < v->block_count && i1 < ptrs_required; i1++, j1 += step1) {
 		void **extent2 = (void **)extent1[i1];
 		void **extent2n = 0;
 		void **extent2p = 0;
@@ -353,22 +405,134 @@ matras_destroy_read_view(struct matras *m, struct matras_view *v)
 			extent2p = (void **) extent1p[i1];
 		}
 		for (i2 = j2 = 0;
-		     i2 < ptrs_in_ext && j1 + j2 < v->block_count;
+		     i2 < ptrs_required && j1 + j2 < v->block_count;
 		     i2++, j2 += step2) {
 			void **extent3 = (void **)extent2[i2];
 			if (next_view->block_count > j1 + j2) {
+				if (extent2[i2] == extent2n[i2]) {
+					continue;
+				}
+			}
+			if (prev_view && prev_view->block_count > j1 + j2) {
+				if (extent2[i2] == extent2p[i2]) {
+					continue;
+				}
+			}
+			new_gc_state = (struct matras_gc_state *)extent3;
+			i2++;
+			j2 += step2;
+			goto set_state;
+		}
+		if (i2 < ptrs_required)
+			continue;
+		/*
+		 * Fall here => have enough bytes in unique extent2.
+		 */
+		new_gc_state = (struct matras_gc_state *)extent2;
+		i1++;
+		j1 += step1;
+		goto set_state;
+	}
+	if (i1 < ptrs_required)
+		return;
+set_state:
+	*new_gc_state = gc_state;
+	new_gc_state->i1 = i1;
+	new_gc_state->j1 = j1;
+	new_gc_state->i2 = i2;
+	new_gc_state->j2 = j2;
+	if (m->gc_state == NULL) {
+		assert(m->last_gc_state == NULL);
+		m->gc_state = new_gc_state;
+		m->last_gc_state = new_gc_state;
+	} else {
+		assert(m->last_gc_state->next == NULL);
+		m->last_gc_state->next = new_gc_state;
+		m->last_gc_state = new_gc_state;
+	}
+}
+
+static void
+matras_gc(struct matras *m, int64_t steps)
+{
+	struct matras_gc_state *gc_state = m->gc_state;
+	if (gc_state == NULL)
+		return;
+	assert(gc_state->next_root != NULL);
+	assert(gc_state->block_count != 0);
+	assert(gc_state->root != gc_state->next_root ||
+	       gc_state->next_block_count == 0);
+	assert(gc_state->prev_root == NULL ||
+	       gc_state->root != gc_state->prev_root ||
+	       gc_state->prev_block_count == 0);
+	assert(gc_state->prev_root != NULL || gc_state->prev_block_count == 0);
+
+	void **extent1 = gc_state->root;
+	void **extent1n = gc_state->next_root;
+	void **extent1p = gc_state->prev_root;
+	matras_id_t i1 = gc_state->i1;
+	matras_id_t j1 = gc_state->j1;
+	matras_id_t i2 = gc_state->i2;
+	matras_id_t j2 = gc_state->j2;
+	matras_id_t block_count = gc_state->block_count;
+	matras_id_t next_block_count = gc_state->next_block_count;
+	matras_id_t prev_block_count = gc_state->prev_block_count;
+
+	matras_id_t step1 = m->mask1 + 1;
+	matras_id_t step2 = m->mask2 + 1;
+	matras_id_t ptrs_in_ext = m->extent_size / (matras_id_t)sizeof(void *);
+	for (; j1 < block_count; i1++, j1 += step1) {
+		if (steps-- == 0)
+			goto pause;
+		void **extent2 = (void **)extent1[i1];
+		void **extent2n = 0;
+		void **extent2p = 0;
+		if (next_block_count > j1) {
+			if (extent1[i1] == extent1n[i1])
+				continue;
+			extent2n = (void **) extent1n[i1];
+		}
+		if (prev_block_count > j1) {
+			if (extent1[i1] == extent1p[i1])
+				continue;
+			extent2p = (void **) extent1p[i1];
+		}
+		for (; i2 < ptrs_in_ext && j1 + j2 < block_count;
+		     i2++, j2 += step2) {
+			if (steps-- == 0)
+				goto pause;
+			void **extent3 = (void **)extent2[i2];
+			if (next_block_count > j1 + j2) {
 				if (extent2[i2] == extent2n[i2])
 					continue;
 			}
-			if (prev_view && prev_view->block_count > j1 + j2) {
+			if (prev_block_count > j1 + j2) {
 				if (extent2[i2] == extent2p[i2])
 					continue;
 			}
+			/*
+			 * We have simply skipped leaf extent, so there is
+			 * no need to check that is used for state.
+			 */
+			assert((void **)gc_state != extent3);
 			matras_free_extent(m, extent3);
 		}
-		matras_free_extent(m, extent2);
+		i2 = j2 = 0;
+		if ((void **)gc_state != extent2)
+			matras_free_extent(m, extent2);
 	}
-	matras_free_extent(m, extent1);
+	if ((void **)gc_state != extent1)
+		matras_free_extent(m, extent1);
+	m->gc_state = gc_state->next;
+	if (m->last_gc_state == gc_state)
+		m->last_gc_state = NULL;
+	/* Block was skipped in the beginning, so we need to free it now. */
+	matras_free_extent(m, gc_state);
+pause:
+	gc_state->i1 = i1;
+	gc_state->j1 = j1;
+	gc_state->i2 = i2;
+	gc_state->j2 = j2;
 }
 
 /*
